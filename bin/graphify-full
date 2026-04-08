@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""graphify-full: Complete pipeline CLI that the graphify skill describes but doesn't implement.
+
+Usage:
+    graphify-full <path>              # full pipeline (AST-only for code, docs require graphify-semantic first)
+    graphify-full <path> --no-viz     # skip HTML visualization
+    graphify-full <path> --merged     # merge with existing semantic extraction in .graphify_semantic.json
+"""
+import sys, json, os, re
+from pathlib import Path
+from collections import Counter
+
+
+def run_pipeline(root_path, mode='normal', no_viz=False, merged=False):
+    root = Path(root_path)
+    out = root / 'graphify-out'
+    out.mkdir(parents=True, exist_ok=True)
+    
+    # Step 1: Detect
+    print(f"[1/7] Detecting files in {root_path}...")
+    from graphify import detect
+    d = detect.detect(root)
+    print(f"  Found {d['total_files']} files, ~{d['total_words']:,} words")
+    for ft, files in d.get('files', {}).items():
+        if files:
+            print(f"    {ft}: {len(files)} files")
+    
+    if d['total_files'] == 0:
+        print("ERROR: No supported files found.")
+        sys.exit(1)
+    
+    # Write detect result
+    (root / '.graphify_detect.json').write_text(json.dumps(d, indent=2))
+    
+    # Step 2: Extract
+    print(f"\n[2/7] Extracting...")
+    
+    # AST extraction for code
+    code_files = [Path(f) for f in d.get('files', {}).get('code', [])]
+    ast_result = {'nodes': [], 'edges': [], 'input_tokens': 0, 'output_tokens': 0}
+    if code_files:
+        from graphify import extract
+        ast_result = extract.extract(code_files)
+        print(f"  AST extraction: {len(ast_result['nodes'])} nodes, {len(ast_result['edges'])} edges")
+    
+    # Semantic extraction (if exists from graphify-semantic or --merged)
+    semantic_result = {'nodes': [], 'edges': [], 'hyperedges': [], 'input_tokens': 0, 'output_tokens': 0}
+    semantic_file = root / '.graphify_semantic.json'
+    if merged and semantic_file.exists():
+        semantic_result = json.loads(semantic_file.read_text())
+        print(f"  Semantic (merged): {len(semantic_result['nodes'])} nodes, {len(semantic_result['edges'])} edges")
+    
+    # Merge AST + semantic
+    extraction = merge_extractions(ast_result, semantic_result)
+    print(f"  Total: {len(extraction['nodes'])} nodes, {len(extraction['edges'])} edges")
+    
+    # Note skipped files
+    doc_files = d.get('files', {}).get('document', [])
+    paper_files = d.get('files', {}).get('paper', [])
+    img_files = d.get('files', {}).get('image', [])
+    semantic_needed = len(doc_files) + len(paper_files) + len(img_files)
+    if semantic_needed > 0 and not semantic_result['nodes']:
+        print(f"  WARNING: {semantic_needed} doc/paper/image files not extracted (run 'graphify-semantic' first)")
+    
+    # Write extraction
+    (root / '.graphify_extract.json').write_text(json.dumps(extraction, indent=2))
+    
+    # Step 3: Build graph
+    print(f"\n[3/7] Building graph...")
+    from graphify import build
+    G = build.build_from_json(extraction)
+    print(f"  Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
+    
+    if G.number_of_nodes() == 0:
+        print("ERROR: Empty graph — extraction produced no nodes.")
+        sys.exit(1)
+    
+    if G.number_of_edges() == 0 and G.number_of_nodes() > 0:
+        print("  WARNING: Graph has nodes but no edges")
+    
+    # Step 4: Cluster
+    print(f"\n[4/7] Clustering...")
+    from graphify import cluster
+    communities = cluster.cluster(G)
+    cohesion = cluster.score_all(G, communities)
+    print(f"  {len(communities)} communities found")
+    
+    # Step 5: Label communities
+    print(f"\n[5/7] Labeling communities...")
+    from graphify import analyze
+    labels = generate_community_labels(G, communities)
+    
+    gods = analyze.god_nodes(G)
+    surprises = analyze.surprising_connections(G, communities)
+    questions = analyze.suggest_questions(G, communities, labels)
+    
+    # Step 6: Generate report and outputs
+    print(f"\n[6/7] Generating outputs...")
+    from graphify import report, export
+    
+    report_text = report.generate(
+        G, communities, cohesion, labels, gods, surprises, d,
+        {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)},
+        str(root), questions
+    )
+    (out / 'GRAPH_REPORT.md').write_text(report_text)
+    
+    # Save labels for viz
+    (root / '.graphify_labels.json').write_text(json.dumps({str(k): v for k, v in labels.items()}))
+    
+    analysis = {
+        'communities': {str(k): v for k, v in communities.items()},
+        'cohesion': {str(k): v for k, v in cohesion.items()},
+        'gods': gods, 'surprises': surprises, 'questions': questions,
+    }
+    (root / '.graphify_analysis.json').write_text(json.dumps(analysis, indent=2))
+    
+    if not no_viz and G.number_of_nodes() <= 5000:
+        export.to_html(G, communities, str(out / 'graph.html'), community_labels=labels)
+        print("  → graph.html generated")
+    
+    export.to_json(G, communities, str(out / 'graph.json'))
+    print("  → graph.json generated")
+    
+    # Step 7: Token benchmark
+    print(f"\n[7/7] Token analysis...")
+    total_words = d.get('total_words', 0)
+    if total_words > 5000:
+        from graphify.benchmark import run_benchmark, print_benchmark
+        result = run_benchmark(str(out / 'graph.json'), corpus_words=total_words)
+        print_benchmark(result)
+    else:
+        print(f"  Corpus is small (~{total_words:,} words) — graph provides structural clarity, not token savings")
+    
+    # Cleanup temp files
+    for f in ['.graphify_detect.json', '.graphify_extract.json', '.graphify_analysis.json', '.graphify_labels.json']:
+        (root / f).unlink(missing_ok=True)
+    
+    print(f"\n{'='*50}")
+    print(f"Pipeline complete. Outputs:")
+    for item in sorted(out.iterdir()):
+        size = item.stat().st_size
+        size_str = f"{size:,}" if size > 1000 else f"{size}"
+        print(f"  {item.name:30s} {size_str:>10s} bytes")
+
+
+def merge_extractions(ast, semantic):
+    """Merge AST and semantic extractions, deduplicating by node id."""
+    seen_ids = {n['id'] for n in ast.get('nodes', [])}
+    merged_nodes = list(ast.get('nodes', []))
+    
+    for n in semantic.get('nodes', []):
+        if n['id'] not in seen_ids:
+            merged_nodes.append(n)
+            seen_ids.add(n['id'])
+    
+    merged_edges = ast.get('edges', []) + semantic.get('edges', [])
+    merged_hyperedges = ast.get('hyperedges', []) + semantic.get('hyperedges', [])
+    
+    return {
+        'nodes': merged_nodes,
+        'edges': merged_edges,
+        'hyperedges': merged_hyperedges,
+        'input_tokens': ast.get('input_tokens', 0) + semantic.get('input_tokens', 0),
+        'output_tokens': ast.get('output_tokens', 0) + semantic.get('output_tokens', 0),
+    }
+
+
+def generate_community_labels(G, communities):
+    """Generate human-readable community labels based on source files and node names."""
+    labels = {}
+    for cid, node_ids in communities.items():
+        # Gather source files for this community
+        source_files = []
+        node_labels = []
+        for nid in node_ids:
+            ndata = G.nodes[nid]
+            sf = ndata.get('source_file', '')
+            if sf:
+                source_files.append(Path(sf).stem)
+            node_labels.append(ndata.get('label', nid))
+        
+        # Find the most common source file stems
+        if source_files:
+            file_counts = Counter(source_files)
+            top_files = file_counts.most_common(3)
+            
+            # Use the most common file as the basis for the label
+            base_name = top_files[0][0].replace('_', ' ').title()
+            
+            if len(set(sf for sf, _ in top_files)) == 1:
+                # All nodes from same file
+                labels[cid] = base_name
+            else:
+                # Multiple files - combine
+                names = [sf.replace('_', ' ').title() for sf, _ in top_files[:2]]
+                labels[cid] = ', '.join(names)
+        else:
+            # No source file info - use node labels
+            short_labels = [l[:30] for l in node_labels[:2]]
+            labels[cid] = ', '.join(short_labels) if short_labels else f'Community {cid}'
+    
+    return labels
+
+
+if __name__ == '__main__':
+    path = sys.argv[1] if len(sys.argv) > 1 else '.'
+    no_viz = '--no-viz' in sys.argv
+    merged = '--merged' in sys.argv
+    run_pipeline(path, no_viz=no_viz, merged=merged)

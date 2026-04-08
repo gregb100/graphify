@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""graphify-semantic: Extract semantic nodes/edges from docs using tiered LLM approach.
+
+Usage:
+    graphify-semantic <path>              # auto-detect size and choose provider
+    graphify-semantic <path> --skip-n N   # skip first N files (for resuming)
+    graphify-semantic <path> --force-ollama    # force Ollama even for large corpuses
+    graphify-semantic <path> --force-openrouter # force OpenRouter even for small corpuses
+
+Tiered approach:
+    Small  (<5K words, <10 docs): Ollama gemma2:2b (free, fast)
+    Medium (5K-50K words):       OpenRouter gemini-2.5-flash-lite (cheap, reliable)
+    Large  (>50K words):         OpenRouter deepseek-v3.2 (better for complex)
+"""
+import sys, json, os, re, requests
+from pathlib import Path
+
+
+OPENROUTER_API_KEY = None
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
+
+# Size thresholds
+SMALL_WORDS = 5000
+SMALL_DOCS = 10
+MEDIUM_WORDS = 50000
+
+# Models
+OLLAMA_MODEL = "gemma2:2b"
+OLLAMA_URL = "http://192.168.148.129:11434"
+OPENROUTER_SMALL = "google/gemini-2.5-flash-lite"  # $0.10/1M in
+OPENROUTER_LARGE = "deepseek/deepseek-v3.2"          # $0.26/1M in, better for complex
+
+
+def get_openrouter_key():
+    """Load OpenRouter API key from OpenClaw models.json."""
+    global OPENROUTER_API_KEY
+    if OPENROUTER_API_KEY:
+        return OPENROUTER_API_KEY
+    
+    models_file = Path.home() / ".openclaw/agents/otto/agent/models.json"
+    if models_file.exists():
+        data = json.loads(models_file.read_text())
+        key = data.get("providers", {}).get("openrouter", {}).get("apiKey", "")
+        if key and key != "ollama-local":
+            OPENROUTER_API_KEY = key
+            return key
+    return None
+
+
+def openrouter_chat(model, messages, temperature=0.2, timeout=60):
+    """Call OpenRouter API."""
+    api_key = get_openrouter_key()
+    if not api_key:
+        raise RuntimeError("OpenRouter API key not found")
+    
+    url = f"{OPENROUTER_URL}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+def detect_corpus_size(root_dir):
+    """Detect corpus size to determine provider."""
+    docs = []
+    total_words = 0
+    
+    for pattern in ['*.md', '*.txt', '*.pdf', '*.doc*']:
+        for f in root_dir.glob(f'**/{pattern}'):
+            if 'graphify-out' in str(f):
+                continue
+            try:
+                content = f.read_text(encoding='utf-8', errors='ignore')
+                total_words += len(content.split())
+                docs.append(f)
+            except:
+                pass
+    
+    print(f"Corpus: ~{total_words:,} words, {len(docs)} docs")
+    
+    if total_words < SMALL_WORDS and len(docs) < SMALL_DOCS:
+        return "ollama", "small"
+    elif total_words < MEDIUM_WORDS:
+        return "openrouter", "medium"
+    else:
+        return "openrouter", "large"
+
+
+def choose_model(corpus_size):
+    """Choose appropriate model based on corpus size."""
+    if corpus_size == "small":
+        return OLLAMA_MODEL
+    elif corpus_size == "medium":
+        return OPENROUTER_SMALL
+    else:
+        return OPENROUTER_LARGE
+
+
+def extract_semantic(root_path, skip_n=0, force_provider=None, model=None):
+    root = Path(root_path)
+    
+    # If root is a file, use its directory
+    if root.is_file():
+        root_dir = root.parent
+        target_file = root
+    else:
+        root_dir = root
+        target_file = None
+    
+    # Find docs to process (count BEFORE filtering for corpus size)
+    docs = []
+    for pattern in ['*.md', '*.txt', '*.pdf', '*.doc*']:
+        docs.extend(root_dir.glob(f'**/{pattern}'))
+    docs = [d for d in docs if 'graphify-out' not in str(d)]
+    
+    # If specific file was given, filter to just that
+    if target_file:
+        docs = [d for d in docs if d.name == target_file.name]
+    
+    # Auto-detect corpus size based on TARGET files, not all files
+    if force_provider:
+        provider = force_provider
+        corpus_size = "forced"
+        model = model or (OLLAMA_MODEL if provider == "ollama" else OPENROUTER_SMALL)
+    else:
+        total_words = sum(len(d.read_text(encoding='utf-8', errors='ignore').split()) for d in docs if d.exists())
+        print(f"Corpus: ~{total_words:,} words, {len(docs)} docs to process")
+        
+        if total_words < SMALL_WORDS and len(docs) < SMALL_DOCS:
+            provider = "ollama"
+            corpus_size = "small"
+        elif total_words < MEDIUM_WORDS:
+            provider = "openrouter"
+            corpus_size = "medium"
+        else:
+            provider = "openrouter"
+            corpus_size = "large"
+        model = model or choose_model(corpus_size)
+    
+    print(f"Provider: {provider} | Model: {model} | Size tier: {corpus_size}")
+    
+    docs = docs[skip_n:]
+    
+    if not docs:
+        print("No docs found.")
+        return
+    
+    print(f"Processing {len(docs)} docs...")
+    
+    # Load existing cache
+    cache_file = root_dir / '.graphify_semantic.json'
+    existing = {'nodes': [], 'edges': [], 'hyperedges': []}
+    if cache_file.exists():
+        existing = json.loads(cache_file.read_text())
+        print(f"  Existing cache: {len(existing['nodes'])} nodes, {len(existing['edges'])} edges")
+    
+    all_nodes = list(existing['nodes'])
+    all_edges = list(existing['edges'])
+    seen_node_ids = {n['id'] for n in all_nodes}
+    
+    # Process each doc
+    for idx, doc in enumerate(docs):
+        print(f"  [{idx+1}/{len(docs)}] {doc.name}...", end=" ", flush=True)
+        try:
+            content = doc.read_text(encoding='utf-8', errors='ignore')
+        except Exception as e:
+            print(f"SKIP: {e}")
+            continue
+        
+        # Truncate based on provider
+        max_chars = 4000 if provider == "ollama" else 6000
+        if len(content) > max_chars:
+            content = content[:max_chars] + "\n...[truncated]"
+        
+        file_stem = doc.stem.lower().replace(' ', '_').replace('-', '_')[:20]
+        
+        # Extract with appropriate LLM
+        if provider == "ollama":
+            result = extract_with_ollama(content, doc.name, file_stem, model)
+        else:
+            result = extract_with_openrouter(content, doc.name, file_stem, model)
+        
+        # Deduplicate nodes
+        new_nodes = 0
+        for node in result.get('nodes', []):
+            if node['id'] not in seen_node_ids:
+                all_nodes.append(node)
+                seen_node_ids.add(node['id'])
+                new_nodes += 1
+        
+        all_edges.extend(result.get('edges', []))
+        
+        n_count = len(result.get('nodes', []))
+        e_count = len(result.get('edges', []))
+        print(f"→ {n_count} nodes ({new_nodes} new), {e_count} edges")
+    
+    # Save
+    result = {'nodes': all_nodes, 'edges': all_edges, 'hyperedges': [], 'input_tokens': 0, 'output_tokens': 0}
+    cache_file.write_text(json.dumps(result, indent=2))
+    
+    print(f"\n✅ Complete: {len(all_nodes)} nodes, {len(all_edges)} edges")
+    print(f"   Run 'graphify-full {root_path} --merged' to rebuild graph")
+
+
+def extract_with_ollama(content, filename, file_stem, model):
+    """Extract using Ollama with simplified prompts + good ID generation."""
+    
+    # Ollama models (especially gemma2:2b) struggle with JSON format and IDs.
+    # Use a two-pass approach: get labels first, then generate IDs
+    OLLAMA = OLLAMA_URL
+    model = model or OLLAMA_MODEL
+    
+    prompt = f"""List {8 if len(content) < 2000 else 5} important concepts from this text. 
+Give each a short, descriptive name (like "memory_store" or "event_capture").
+
+Text: {content[:1500]}
+
+Format - one concept per line:
+CONCEPT: short_name
+
+Concepts:"""
+
+    try:
+        resp = requests.post(f"{OLLAMA}/api/chat",
+            json={'model': model, 'messages': [{'role': 'user', 'content': prompt}], 'stream': False},
+            timeout=45)
+        resp.raise_for_status()
+        text = resp.json().get('message', {}).get('content', '')
+    except Exception as e:
+        print(f"Ollama failed ({e}), using keyword extraction")
+        return basic_extract(content, filename, file_stem)
+    
+    # Parse labels from response
+    labels = []
+    for line in text.split('\n'):
+        line = line.strip()
+        if line.upper().startswith('CONCEPT:') or line.upper().startswith('- '):
+            # Extract the name after the colon or dash
+            label = re.sub(r'^(CONCEPT:|-)\s*', '', line, flags=re.IGNORECASE).strip()
+            if label and len(label) > 1:
+                # Clean up - remove special chars
+                label = re.sub(r'[^a-zA-Z0-9_\s]', '', label).strip()
+                if label:
+                    labels.append(label)
+    
+    # Fallback: if no labels found, try numbered list
+    if not labels:
+        for line in text.split('\n'):
+            match = re.search(r'\d+[.):]\s*(.+)', line)
+            if match:
+                label = match.group(1).strip()
+                if label and len(label) > 1:
+                    labels.append(label)
+    
+    # If still no labels, use keyword extraction
+    if not labels:
+        return basic_extract(content, filename, file_stem)
+    
+    # Generate nodes from labels
+    nodes = []
+    edges = []
+    node_ids = []
+    
+    for i, label in enumerate(labels[:8]):  # Max 8 nodes per doc
+        nid = f"{file_stem}_{re.sub(r'[^a-zA-Z0-9]', '_', label.lower())[:15]}"
+        nodes.append({
+            'id': nid,
+            'label': label,
+            'file_type': 'document',
+            'source_file': filename
+        })
+        node_ids.append(nid)
+    
+    # Generate simple co-occurrence edges between adjacent concepts
+    for i in range(len(node_ids) - 1):
+        edges.append({
+            'source': node_ids[i],
+            'target': node_ids[i + 1],
+            'relation': 'relates_to',
+            'confidence': 'INFERRED',
+            'confidence_score': 0.5,
+            'source_file': filename
+        })
+    
+    return {'nodes': nodes, 'edges': edges, 'hyperedges': []}
+
+
+def extract_with_openrouter(content, filename, file_stem, model):
+    """Extract using OpenRouter with JSON format."""
+    
+    model = model or OPENROUTER_SMALL
+    
+    system_prompt = """You extract knowledge graph entities from documents. Return ONLY valid JSON.
+
+Format:
+{"nodes": [{"id": "unique_id", "label": "Name", "file_type": "document", "source_file": "FILENAME"}], "edges": [{"source": "id1", "target": "id2", "relation": "relates_to|references|defines|uses", "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "FILENAME"}], "hyperedges": []}
+
+Use short IDs like "concept_name". Extract key concepts, components, and relationships. Include at least 3-5 nodes per document."""
+
+    user_prompt = f"""Extract knowledge graph from:
+
+{content[:5000]}
+
+Return JSON:"""
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+    
+    try:
+        text = openrouter_chat(model, messages)
+    except Exception as e:
+        print(f"OpenRouter failed ({e}), using keyword extraction")
+        return basic_extract(content, filename, file_stem)
+    
+    return parse_extraction(text, file_stem, filename)
+
+
+def parse_extraction(text, file_stem, filename):
+    """Parse LLM response into nodes/edges."""
+    
+    # Clean markdown
+    text = re.sub(r'```json\s*', '', text)
+    text = re.sub(r'```\s*', '', text).strip()
+    
+    # Find JSON
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if not match:
+        return basic_extract(text[:1000], filename, file_stem)
+    
+    try:
+        data = json.loads(match.group())
+        
+        nodes = []
+        for node in data.get('nodes', []):
+            if 'id' not in node or not node['id']:
+                continue
+            nid = node['id']
+            if not nid.startswith(file_stem):
+                nid = f"{file_stem}_{nid}"
+            nodes.append({
+                'id': nid,
+                'label': node.get('label', nid),
+                'file_type': 'document',
+                'source_file': filename
+            })
+        
+        edges = []
+        for edge in data.get('edges', []):
+            src = edge.get('source', '')
+            tgt = edge.get('target', '')
+            if not src or not tgt:
+                continue
+            if not src.startswith(file_stem):
+                src = f"{file_stem}_{src}"
+            if not tgt.startswith(file_stem):
+                tgt = f"{file_stem}_{tgt}"
+            edges.append({
+                'source': src,
+                'target': tgt,
+                'relation': edge.get('relation', 'relates_to'),
+                'confidence': edge.get('confidence', 'INFERRED'),
+                'confidence_score': edge.get('confidence_score', 0.7),
+                'source_file': filename
+            })
+        
+        return {'nodes': nodes, 'edges': edges, 'hyperedges': []}
+    except Exception as e:
+        print(f"Parse error: {e}")
+        return basic_extract(text[:1000], filename, file_stem)
+
+
+def basic_extract(content, filename, file_stem):
+    """Fallback: keyword extraction."""
+    words = re.findall(r'[A-Z][a-zA-Z_]+', content)
+    freq = {}
+    for w in words:
+        if len(w) > 3:
+            freq[w] = freq.get(w, 0) + 1
+    
+    nodes = []
+    for word, _ in sorted(freq.items(), key=lambda x: -x[1])[:10]:
+        nid = f"{file_stem}_{word.lower()}"
+        nodes.append({
+            'id': nid,
+            'label': word,
+            'file_type': 'document',
+            'source_file': filename
+        })
+    
+    edges = []
+    for i in range(len(nodes) - 1):
+        edges.append({
+            'source': nodes[i]['id'],
+            'target': nodes[i+1]['id'],
+            'relation': 'appears_with',
+            'confidence': 'INFERRED',
+            'confidence_score': 0.5,
+            'source_file': filename
+        })
+    
+    return {'nodes': nodes, 'edges': edges, 'hyperedges': []}
+
+
+if __name__ == '__main__':
+    path = '.'
+    skip_n = 0
+    force_provider = None
+    model = None
+    
+    i = 1
+    while i < len(sys.argv):
+        arg = sys.argv[i]
+        if arg == '--skip-n' and i + 1 < len(sys.argv):
+            skip_n = int(sys.argv[i + 1])
+            i += 2
+        elif arg == '--force-ollama':
+            force_provider = 'ollama'
+            i += 1
+        elif arg == '--force-openrouter':
+            force_provider = 'openrouter'
+            i += 1
+        elif arg == '--model' and i + 1 < len(sys.argv):
+            model = sys.argv[i + 1]
+            i += 2
+        elif not arg.startswith('--'):
+            path = arg
+            i += 1
+        else:
+            i += 1
+    
+    extract_semantic(path, skip_n=skip_n, force_provider=force_provider, model=model)

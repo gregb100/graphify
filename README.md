@@ -282,3 +282,37 @@ NetworkX + Leiden (graspologic) + tree-sitter + vis.js. Semantic extraction via 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for module responsibilities and how to add a language.
 
 </details>
+
+---
+
+## Otto's Customization
+
+This fork adds CLI wrappers for OpenClaw integration:
+
+### Installation
+
+```bash
+# Install upstream package (required)
+pip install graphifyy
+
+# Clone Otto's fork
+git clone https://github.com/gregb100/graphify.git
+cd graphify
+
+# Option 1: Install as editable package
+pip install -e .
+
+# Option 2: Just copy the wrapper scripts
+cp bin/graphify-full ~/.local/bin/
+cp bin/graphify-semantic ~/.local/bin/
+chmod +x ~/.local/bin/graphify-*
+```
+
+### Otto's Additions
+
+- **graphify-full** - Complete pipeline CLI (detect → extract → build → cluster → report)
+- **graphify-semantic** - Tiered LLM extraction
+  - Small corpuses: Ollama gemma2:2b (free, fast)
+  - Medium/Large corpuses: OpenRouter gemini-2.5-flash-lite or deepseek-v3.2
+
+See SKILL.md for OpenClaw skill integration.
